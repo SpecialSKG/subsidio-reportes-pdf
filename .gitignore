@@ -1,0 +1,12 @@
+# Ignore contents of Input/main and Input/sub, but allow the directories to exist
+Input/main/*
+Input/main/**/*
+!Input/main/
+Input/sub/*
+Input/sub/**/*
+!Input/sub/
+
+# Ignore contents of output, but allow the directory to exist
+output/*
+output/**/*
+!output/
