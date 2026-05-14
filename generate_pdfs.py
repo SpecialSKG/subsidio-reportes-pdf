@@ -18,7 +18,7 @@ Opcional:
   --limit 100           (solo primeros 100)
   --only "06784334-6"   (filtrar por DUI; acepta varios separados por coma)
   --include-empty       (incluye filas aunque vengan vacías)
-  --workers 4           (procesar en paralelo con 4 workers; 0 = auto)
+  --workers 4           (procesar en paralelo; 1=secuencial, default)
   --zip                 (exportar todo a un ZIP al finalizar)
 """
 
@@ -29,7 +29,6 @@ import time
 import argparse
 import logging
 import zipfile
-import shutil
 import multiprocessing as mp
 from typing import Any, Optional
 from pathlib import Path
@@ -49,6 +48,18 @@ log = logging.getLogger(__name__)
 
 
 DUI_COL = "01. Numero de Documento Único de Identidad (DUI)"
+
+
+def load_config(path: str = "config.json") -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"Could not load {path}: {e}")
+        return {}
 
 
 def safe_text(x: Any) -> str:
@@ -108,6 +119,10 @@ TABLE_STYLE = TableStyle([
 ])
 
 _label_cache: dict[str, Paragraph] = {}
+
+
+def label_cache_clear():
+    _label_cache.clear()
 
 
 def _get_label(col_name: str) -> Paragraph:
@@ -179,12 +194,28 @@ def make_pdf_for_record(main_row, sub_rows: Optional[pd.DataFrame],
     doc.build(story)
 
 
-def process_chunk(chunk_df: pd.DataFrame, sub_groups: dict, include_empty: bool,
-                  output_dir: str, worker_id: int) -> tuple[int, int]:
-    label_cache_clear()
-    worker_dir = os.path.join(output_dir, f".tmp_{worker_id}")
-    os.makedirs(worker_dir, exist_ok=True)
+_worker_lock: Any = None
 
+
+def _init_worker(lock):
+    global _worker_lock
+    _worker_lock = lock
+
+
+def _reserve_filename(output_dir: str, base: str, rid: str) -> str:
+    with _worker_lock:
+        filename = sanitize_filename(f"{base}.pdf")
+        out_path = os.path.join(output_dir, filename)
+        if os.path.exists(out_path):
+            filename = sanitize_filename(f"{base}-{rid}.pdf")
+            out_path = os.path.join(output_dir, filename)
+        Path(out_path).touch()
+    return out_path
+
+
+def process_chunk(chunk_df: pd.DataFrame, sub_groups: dict, include_empty: bool,
+                  output_dir: str) -> tuple[int, int]:
+    label_cache_clear()
     generated = 0
     failed = 0
 
@@ -196,13 +227,8 @@ def process_chunk(chunk_df: pd.DataFrame, sub_groups: dict, include_empty: bool,
 
             dui = safe_text(row.get(DUI_COL, "")).strip()
             base = dui if dui != "" else rid
-            filename = sanitize_filename(f"{base}.pdf")
-            out_path = os.path.join(worker_dir, filename)
 
-            if os.path.exists(out_path):
-                filename = sanitize_filename(f"{base}-{rid}.pdf")
-                out_path = os.path.join(worker_dir, filename)
-
+            out_path = _reserve_filename(output_dir, base, rid)
             sub_rows = sub_groups.get(rid)
             make_pdf_for_record(row, sub_rows, out_path, include_empty)
             generated += 1
@@ -213,67 +239,38 @@ def process_chunk(chunk_df: pd.DataFrame, sub_groups: dict, include_empty: bool,
     return generated, failed
 
 
-def _collect_results(output_dir: str, n_workers: int, create_zip: bool):
-    if create_zip:
-        zip_path = os.path.join(os.path.dirname(output_dir), "subsidios_pdfs.zip")
-        log.info(f"Creating ZIP: {zip_path} ...")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i in range(n_workers):
-                worker_dir = os.path.join(output_dir, f".tmp_{i}")
-                if not os.path.isdir(worker_dir):
-                    continue
-                for pdf_path in Path(worker_dir).iterdir():
-                    if pdf_path.suffix.lower() == ".pdf":
-                        zf.write(str(pdf_path), pdf_path.name)
-
-        for i in range(n_workers):
-            shutil.rmtree(os.path.join(output_dir, f".tmp_{i}"), ignore_errors=True)
-        log.info(f"ZIP created: {zip_path}")
-    else:
-        log.info("Moving PDFs to output directory...")
-        seen: set[str] = set()
-        for i in range(n_workers):
-            worker_dir = os.path.join(output_dir, f".tmp_{i}")
-            if not os.path.isdir(worker_dir):
-                continue
-            for pdf_path in Path(worker_dir).iterdir():
-                if pdf_path.suffix.lower() != ".pdf":
-                    continue
-                dst = os.path.join(output_dir, pdf_path.name)
-                if pdf_path.name in seen or os.path.exists(dst):
-                    dst = os.path.join(output_dir, f"{pdf_path.stem}_{i}{pdf_path.suffix}")
-                seen.add(os.path.basename(dst))
-                shutil.move(str(pdf_path), dst)
-            shutil.rmtree(worker_dir, ignore_errors=True)
-
-
-def _create_zip(source_dir: str, target_dir: str):
-    zip_path = os.path.join(os.path.dirname(target_dir), "subsidios_pdfs.zip")
-    log.info(f"Creating ZIP: {zip_path} ...")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for pdf_path in Path(source_dir).glob("*.pdf"):
-            zf.write(str(pdf_path), pdf_path.name)
-    log.info(f"ZIP created: {zip_path}")
-
-
-def label_cache_clear():
-    _label_cache.clear()
+def _process_chunk_wrapper(args):
+    return process_chunk(*args)
 
 
 def main():
     start_time = time.time()
 
+    config = load_config()
+    cfg_paths = config.get("paths", {})
+    cfg_opts = config.get("options", {})
+
     parser = argparse.ArgumentParser(description="Genera PDFs por cada registro del formulario principal")
-    parser.add_argument("--main", required=True, help="CSV o carpeta del formulario principal")
-    parser.add_argument("--sub", required=True, help="CSV o carpeta del subformulario")
-    parser.add_argument("--out", required=True, help="Carpeta de salida para PDFs")
-    parser.add_argument("--limit", type=int, default=0, help="0=sin límite; N=solo primeros N")
-    parser.add_argument("--only", default="", help="Filtrar por DUI(s), separados por coma")
-    parser.add_argument("--include-empty", action="store_true", help="Incluir campos vacíos en el PDF")
-    parser.add_argument("--zip", action="store_true", help="Exportar todo a un ZIP al finalizar")
-    parser.add_argument("--workers", type=int, default=0,
-                        help="Workers en paralelo (0 = CPU count, 1 = secuencial)")
+    parser.add_argument("--main", default=cfg_paths.get("main"),
+                        help="CSV o carpeta del formulario principal (default: config.json)")
+    parser.add_argument("--sub", default=cfg_paths.get("sub"),
+                        help="CSV o carpeta del subformulario (default: config.json)")
+    parser.add_argument("--out", default=cfg_paths.get("out"),
+                        help="Carpeta de salida para PDFs (default: config.json)")
+    parser.add_argument("--limit", type=int, default=cfg_opts.get("limit", 0),
+                        help="0=sin límite; N=solo primeros N")
+    parser.add_argument("--only", default="",
+                        help="Filtrar por DUI(s), separados por coma")
+    parser.add_argument("--include-empty", action="store_true",
+                        help="Incluir campos vacíos en el PDF")
+    parser.add_argument("--zip", action="store_true",
+                        help="Exportar todo a un ZIP al finalizar")
+    parser.add_argument("--workers", type=int, default=cfg_opts.get("workers", 1),
+                        help="Workers en paralelo (1=secuencial, N=paralelo con N workers)")
     args = parser.parse_args()
+
+    if not args.main or not args.sub or not args.out:
+        parser.error("--main, --sub, and --out are required (via CLI or config.json)")
 
     log.info("Reading CSV files...")
     main_df = read_and_concat_csvs(args.main)
@@ -300,61 +297,73 @@ def main():
         log.warning("No records to process.")
         return
 
-    n_workers = max(1, args.workers if args.workers > 0 else mp.cpu_count())
-    n_workers = min(n_workers, total_records)
+    n_workers = max(1, min(args.workers, total_records))
 
     os.makedirs(args.out, exist_ok=True)
 
-    if n_workers <= 1:
-        generated = 0
-        failed = 0
-        label_cache_clear()
-        used_names: set[str] = set()
+    generated = 0
+    failed = 0
+    placeholder_files: list[str] = []
 
-        with tqdm(total=total_records, desc="Generating PDFs", unit="PDF", ncols=100, colour="green") as pbar:
-            for _, row in main_df.iterrows():
-                try:
-                    rid = safe_text(row.get("Record Link ID", "")).strip()
-                    if rid == "":
-                        pbar.update(1)
-                        continue
+    try:
+        if n_workers <= 1:
+            label_cache_clear()
+            used_names: set[str] = set()
 
-                    dui = safe_text(row.get(DUI_COL, "")).strip()
-                    base = dui if dui != "" else rid
-                    filename = sanitize_filename(f"{base}.pdf")
-                    out_path = os.path.join(args.out, filename)
+            with tqdm(total=total_records, desc="Generando PDFs", unit="PDF", ncols=100, colour="green") as pbar:
+                for _, row in main_df.iterrows():
+                    try:
+                        rid = safe_text(row.get("Record Link ID", "")).strip()
+                        if rid == "":
+                            pbar.update(1)
+                            continue
 
-                    if filename in used_names or os.path.exists(out_path):
-                        filename = sanitize_filename(f"{base}-{rid}.pdf")
+                        dui = safe_text(row.get(DUI_COL, "")).strip()
+                        base = dui if dui != "" else rid
+                        filename = sanitize_filename(f"{base}.pdf")
                         out_path = os.path.join(args.out, filename)
 
-                    used_names.add(filename)
-                    sub_rows = sub_groups.get(rid)
-                    make_pdf_for_record(row, sub_rows, out_path, args.include_empty)
-                    generated += 1
-                except Exception:
-                    log.exception(f"Failed for RID={safe_text(row.get('Record Link ID', ''))}")
-                    failed += 1
+                        if filename in used_names or os.path.exists(out_path):
+                            filename = sanitize_filename(f"{base}-{rid}.pdf")
+                            out_path = os.path.join(args.out, filename)
 
-                pbar.update(1)
+                        used_names.add(filename)
+                        sub_rows = sub_groups.get(rid)
+                        make_pdf_for_record(row, sub_rows, out_path, args.include_empty)
+                        generated += 1
+                    except Exception:
+                        log.exception(f"Failed for RID={safe_text(row.get('Record Link ID', ''))}")
+                        failed += 1
 
-        if args.zip and generated > 0:
-            _create_zip(args.out, args.out)
+                    pbar.update(1)
+        else:
+            chunks = _split_df(main_df, n_workers)
+            worker_args = [(chunk, sub_groups, args.include_empty, args.out)
+                           for chunk in chunks]
 
-    else:
-        chunks = _split_df(main_df, n_workers)
-        worker_args = [(chunk, sub_groups, args.include_empty, args.out, i)
-                       for i, chunk in enumerate(chunks)]
+            log.info(f"Using {n_workers} parallel workers...")
 
-        log.info(f"Using {n_workers} parallel workers...")
+            with mp.Manager() as manager:
+                lock = manager.Lock()
+                with mp.Pool(n_workers, initializer=_init_worker, initargs=(lock,)) as pool:
+                    with tqdm(total=total_records, desc="Generando PDFs", unit="PDF", ncols=100, colour="green") as pbar:
+                        for g, f in pool.imap_unordered(_process_chunk_wrapper, worker_args):
+                            generated += g
+                            failed += f
+                            pbar.update(g)
 
-        with mp.Pool(n_workers) as pool:
-            results = pool.starmap(process_chunk, worker_args)
-
-        generated = sum(r[0] for r in results)
-        failed = sum(r[1] for r in results)
-
-        _collect_results(args.out, n_workers, args.zip)
+    finally:
+        placeholder_files = [
+            os.path.join(args.out, f)
+            for f in os.listdir(args.out)
+            if os.path.isfile(os.path.join(args.out, f))
+            and os.path.getsize(os.path.join(args.out, f)) == 0
+        ]
+        for pf in placeholder_files:
+            try:
+                os.unlink(pf)
+            except Exception:
+                pass
 
     elapsed = time.time() - start_time
     if elapsed < 60:
@@ -362,9 +371,20 @@ def main():
     else:
         time_str = f"{int(elapsed // 60)} min {elapsed % 60:.2f} sec"
 
+    print()
+    print(f"  OK. Generated: {generated} PDFs  |  Failed: {failed}  |  Time: {time_str}")
+
+    if args.zip and generated > 0:
+        zip_path = os.path.join(args.out, "subsidios_pdfs.zip")
+        log.info(f"Creating ZIP: {zip_path} ...")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for pdf_path in Path(args.out).glob("*.pdf"):
+                if pdf_path.name == "subsidios_pdfs.zip":
+                    continue
+                zf.write(str(pdf_path), pdf_path.name)
+        print(f"  ZIP: {zip_path}")
+
     log.info(f"Done. Generated: {generated}  |  Failed: {failed}  |  Time: {time_str}")
-    if args.zip:
-        log.info(f"ZIP: {os.path.join(os.path.dirname(args.out), 'subsidios_pdfs.zip')}")
 
 
 if __name__ == "__main__":

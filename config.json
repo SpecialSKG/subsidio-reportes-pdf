@@ -1,0 +1,11 @@
+{
+  "paths": {
+    "main": "input/main",
+    "sub": "input/sub",
+    "out": "output/pdfs"
+  },
+  "options": {
+    "workers": 1,
+    "limit": 0
+  }
+}
