@@ -359,6 +359,8 @@ def _process_chunk_wrapper(args):
 
 
 def main():
+    import multiprocessing as mp
+    mp.freeze_support()
     start_time = time.time()
 
     config = load_config()
