@@ -26,6 +26,7 @@ import os
 import re
 import math
 import time
+import datetime
 import argparse
 import logging
 import zipfile
@@ -36,11 +37,14 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, HRFlowable
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -103,20 +107,112 @@ def _split_df(df: pd.DataFrame, n: int) -> list[pd.DataFrame]:
 
 _styles = getSampleStyleSheet()
 
-TITLE_STYLE = ParagraphStyle("title", parent=_styles["Title"], fontSize=16, leading=20, spaceAfter=8)
-SUBTITLE_STYLE = ParagraphStyle("subtitle", parent=_styles["Normal"], fontSize=10, leading=12, textColor=colors.grey, spaceAfter=12)
-LABEL_STYLE = ParagraphStyle("label", parent=_styles["Normal"], fontSize=10, leading=12)
-VALUE_STYLE = ParagraphStyle("value", parent=_styles["Normal"], fontSize=10, leading=12)
-H2_STYLE = ParagraphStyle("h2", parent=_styles["Heading2"], spaceAfter=6)
+# ── Font registration & color palette ─────────────────────────────────────
 
-TABLE_STYLE = TableStyle([
-    ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ("LEFTPADDING", (0, 0), (-1, -1), 10),
-    ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-    ("TOPPADDING", (0, 0), (-1, -1), 8),
-    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-])
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_FONTS_DIR = _SCRIPT_DIR / ".agents" / "skills" / "canvas-design" / "canvas-fonts"
+
+_FONT_BODY = "Helvetica"
+_FONT_BOLD = "Helvetica-Bold"
+_FONT_MONO = "Courier"
+
+if _FONTS_DIR.exists():
+    _registered = {}
+    for family, fname in [
+        ("WorkSans", "WorkSans-Regular.ttf"),
+        ("WorkSans-Bold", "WorkSans-Bold.ttf"),
+        ("JetBrainsMono", "JetBrainsMono-Regular.ttf"),
+    ]:
+        fp = _FONTS_DIR / fname
+        if fp.exists():
+            try:
+                pdfmetrics.registerFont(TTFont(family, str(fp)))
+                _registered[family] = True
+            except Exception:
+                pass
+    if "WorkSans" in _registered:
+        _FONT_BODY = "WorkSans"
+    if "WorkSans-Bold" in _registered:
+        _FONT_BOLD = "WorkSans-Bold"
+    if "JetBrainsMono" in _registered:
+        _FONT_MONO = "JetBrainsMono"
+
+NAVY = colors.HexColor("#1C4F8E")
+DARK_BLUE = colors.HexColor("#0D3D6E")
+WHITE = colors.white
+SLATE = colors.HexColor("#4A5568")
+NEAR_BLACK = colors.HexColor("#1A202C")
+LIGHT_GRAY = colors.HexColor("#E1E1E1")
+ROW_ALT = colors.HexColor("#F1F4F9")
+GOLD = colors.HexColor("#C4953A")
+
+# ── Style definitions ─────────────────────────────────────────────────────
+
+TITLE_STYLE = ParagraphStyle("title", fontName=_FONT_BOLD, fontSize=16,
+                              leading=20, textColor=NAVY, spaceAfter=2)
+SUBTITLE_STYLE = ParagraphStyle("subtitle", fontName=_FONT_BODY, fontSize=8,
+                                 leading=12, textColor=SLATE, spaceAfter=14)
+LABEL_STYLE = ParagraphStyle("label", fontName=_FONT_BOLD, fontSize=9,
+                              leading=14, textColor=NAVY)
+VALUE_STYLE = ParagraphStyle("value", fontName=_FONT_BODY, fontSize=9,
+                              leading=14, textColor=NEAR_BLACK)
+H2_STYLE = ParagraphStyle("h2", fontName=_FONT_BOLD, fontSize=11,
+                           leading=14, textColor=NAVY, spaceAfter=6)
+
+def _make_table_style(num_rows: int) -> TableStyle:
+    cmds = [
+        ("LINEBELOW", (0, 0), (-1, -1), 0.4, LIGHT_GRAY),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.6, LIGHT_GRAY),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.6, LIGHT_GRAY),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    for i in range(1, num_rows, 2):
+        cmds.append(("BACKGROUND", (0, i), (-1, i), ROW_ALT))
+    return TableStyle(cmds)
+
+# ── Header / Footer callback ──────────────────────────────────────────────
+
+def _header_footer(canvas, doc):
+    canvas.saveState()
+    pw, ph = doc.pagesize
+    ml = doc.leftMargin
+    cw = doc.width
+    page_num = doc.page + 1
+
+    # ── Header separator ──
+    hy = ph - doc.topMargin
+    canvas.setStrokeColor(NAVY)
+    canvas.setLineWidth(0.6)
+    canvas.line(ml, hy, ml + cw, hy)
+
+    canvas.setFont(_FONT_BOLD, 7)
+    canvas.setFillColor(NAVY)
+    canvas.drawString(ml, hy + 5, "SUBSIDIO GLP — SOLICITUD")
+
+    canvas.setFont(_FONT_BODY, 7)
+    canvas.setFillColor(SLATE)
+    canvas.drawRightString(ml + cw, hy + 5,
+                           datetime.date.today().strftime("%d/%m/%Y"))
+
+    # ── Footer separator ──
+    fy = doc.bottomMargin
+    canvas.setStrokeColor(LIGHT_GRAY)
+    canvas.setLineWidth(0.4)
+    canvas.line(ml, fy, ml + cw, fy)
+
+    now_str = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+    canvas.setFont(_FONT_BODY, 7)
+    canvas.setFillColor(SLATE)
+    canvas.drawString(ml, fy - 12, f"Página {page_num} · {now_str}")
+    canvas.drawRightString(ml + cw, fy - 12,
+                           "Documento generado electrónicamente")
+
+    canvas.restoreState()
+
 
 _label_cache: dict[str, Paragraph] = {}
 
@@ -128,7 +224,7 @@ def label_cache_clear():
 def _get_label(col_name: str) -> Paragraph:
     p = _label_cache.get(col_name)
     if p is None:
-        p = Paragraph(f"<b>{col_name}</b>", LABEL_STYLE)
+        p = Paragraph(col_name, LABEL_STYLE)
         _label_cache[col_name] = p
     return p
 
@@ -145,30 +241,47 @@ def build_table_rows(row, include_empty: bool, exclude_cols: set) -> list:
     return rows
 
 
+def _col_widths(row, exclude_cols: set, total_width: float) -> tuple[float, float]:
+    labels = [c for c in row.keys() if c not in exclude_cols]
+    if not labels:
+        return 2.2 * inch, total_width - 2.2 * inch
+    max_w = max(stringWidth(c, _FONT_BOLD, 9) + 16 for c in labels)
+    lw = min(max(max_w, 1.5 * inch), 3.0 * inch)
+    return lw, total_width - lw
+
+
 def make_pdf_for_record(main_row, sub_rows: Optional[pd.DataFrame],
                         out_path: str, include_empty: bool) -> None:
+    total_w = letter[0] - 1.5 * inch  # 7.0 in
+
     doc = SimpleDocTemplate(
         out_path,
         pagesize=letter,
-        leftMargin=0.7 * inch,
-        rightMargin=0.7 * inch,
-        topMargin=0.7 * inch,
-        bottomMargin=0.7 * inch
+        leftMargin=0.75 * inch,
+        rightMargin=0.75 * inch,
+        topMargin=0.85 * inch,
+        bottomMargin=0.75 * inch,
+        onFirstPage=_header_footer,
+        onLaterPages=_header_footer,
     )
 
     story = []
-    story.append(Paragraph("Solicitud De Subsidio GLP - V3 Report", TITLE_STYLE))
-    story.append(Paragraph("Form: Solicitud para aplicar al subsidio del GLP - v3", SUBTITLE_STYLE))
+    story.append(Paragraph("Solicitud de Subsidio GLP", TITLE_STYLE))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT_GRAY, spaceAfter=14))
 
     main_rows = build_table_rows(main_row, include_empty=include_empty, exclude_cols={"Record Link ID"})
-    main_table = Table(main_rows, colWidths=[2.8 * inch, 4.2 * inch], repeatRows=0)
-    main_table.setStyle(TABLE_STYLE)
-    story.append(main_table)
+    if main_rows:
+        lw, vw = _col_widths(main_row, {"Record Link ID"}, total_w)
+        main_table = Table(main_rows, colWidths=[lw, vw], repeatRows=0)
+        main_table.setStyle(_make_table_style(len(main_rows)))
+        story.append(main_table)
 
     if sub_rows is not None and len(sub_rows) > 0:
+        story.append(Spacer(1, 18))
         story.append(PageBreak())
-        story.append(Paragraph("SubForm4 - Subregistros", TITLE_STYLE))
-        story.append(Paragraph("Entradas asociadas al subformulario (agrupadas por #).", SUBTITLE_STYLE))
+        story.append(Paragraph("Caracterización del grupo familiar", TITLE_STYLE))
+        story.append(Paragraph("Composición y datos del núcleo familiar", SUBTITLE_STYLE))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT_GRAY, spaceAfter=14))
 
         if "S.No." in sub_rows.columns:
             try:
@@ -186,10 +299,12 @@ def make_pdf_for_record(main_row, sub_rows: Optional[pd.DataFrame],
             story.append(Paragraph(head, H2_STYLE))
 
             sub_table_rows = build_table_rows(sub_row, include_empty=include_empty, exclude_cols=exclude_sub)
-            sub_table = Table(sub_table_rows, colWidths=[2.8 * inch, 4.2 * inch])
-            sub_table.setStyle(TABLE_STYLE)
-            story.append(sub_table)
-            story.append(Spacer(1, 12))
+            if sub_table_rows:
+                lw, vw = _col_widths(sub_row, exclude_sub, total_w)
+                sub_table = Table(sub_table_rows, colWidths=[lw, vw])
+                sub_table.setStyle(_make_table_style(len(sub_table_rows)))
+                story.append(sub_table)
+                story.append(Spacer(1, 12))
 
     doc.build(story)
 
